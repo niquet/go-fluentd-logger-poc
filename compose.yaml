@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    depends_on:
+      - fluentbit
+    environment:
+      - FLUENT_HOST=fluentbit
+      - FLUENT_PORT=24224
+      - FLUENT_ASYNC=true
+      - FLUENT_BUFFER_LIMIT=8192
+      - FLUENT_MAX_RETRY=13
+      - FLUENT_RETRY_WAIT=500
+    networks:
+      - logging-net
+
+  fluentbit:
+    image: cr.fluentbit.io/fluent/fluent-bit:2.2
+    ports:
+      - "24224:24224"
+    volumes:
+      - ./fluentbit.conf:/fluent-bit/etc/fluent-bit.conf
+    networks:
+      - logging-net
+
+  fluentd:
+    image: fluent/fluentd:v1.16-1
+    ports:
+      - "24225:24224"
+    volumes:
+      - ./fluentd.conf:/fluentd/etc/fluent.conf
+    networks:
+      - logging-net
+
+networks:
+  logging-net:
+    driver: bridge
