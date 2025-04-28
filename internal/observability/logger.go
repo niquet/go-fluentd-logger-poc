@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fluent/fluent-logger-golang/fluent"
@@ -14,50 +16,51 @@ import (
 )
 
 const (
-	defaultFluentTag       = "app.logs"
-	defaultShutdownTimeout = 5 * time.Second
+	defaultFluentTag                = "app.logs"
+	defaultLogLevel                 = zapcore.DebugLevel
+	defaultShutdownTimeout          = 5 * time.Second
+	compatibleLevelWarningUpperCase = "WARNING"
 )
 
 var (
 	ErrLoggerClosed = errors.New("logger is closed")
 )
 
-// FluentConfig wraps fluent.Config with additional fields.
-type FluentConfig struct {
-	Fluent  fluent.Config
-	Tag     string
-	Timeout time.Duration
-}
-
 // FluentLogger implements zapcore.WriteSyncer with thread safety.
 type FluentLogger struct {
-	mu      sync.Mutex
 	logger  *fluent.Fluent
 	tag     string
-	closed  bool
+	closed  atomic.Bool
 	timeout time.Duration
 }
 
-// WrappedLogger wraps zap.SugaredLogger with ownership of resources.
-type WrappedLogger struct {
+// SugaredLoggerConfig wraps fluent.Config with additional fields.
+type SugaredLoggerConfig struct {
+	FluentConfig fluent.Config
+	Tag          string
+	LogLevel     string
+}
+
+// SugaredLogger wraps zap.SugaredLogger with ownership of resources.
+type SugaredLogger struct {
 	*zap.SugaredLogger
 	fluent    *FluentLogger
 	closeOnce sync.Once
 }
 
-// WrappedLogger provides a logger with atomic log level handling and
+// NewSugaredLogger provides a logger with atomic log level handling and
 // proper resource cleanup.
 // It bridges Zap's formatting with Fluent's transport layer.
-func NewWrappedLogger(cfg FluentConfig) (*WrappedLogger, error) {
+func NewSugaredLogger(cfg *SugaredLoggerConfig) (*SugaredLogger, error) {
 	// Validate configuration before initialization
 	if cfg.Tag == "" {
 		cfg.Tag = defaultFluentTag
 	}
-	if cfg.Timeout == 0 {
-		cfg.Timeout = defaultShutdownTimeout
+	if cfg.FluentConfig.Timeout == 0 {
+		cfg.FluentConfig.Timeout = defaultShutdownTimeout
 	}
 
-	fl, err := fluent.New(cfg.Fluent)
+	fl, err := fluent.New(cfg.FluentConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create fluent logger: %w", err)
 	}
@@ -65,26 +68,32 @@ func NewWrappedLogger(cfg FluentConfig) (*WrappedLogger, error) {
 	fluentLogger := &FluentLogger{
 		logger:  fl,
 		tag:     cfg.Tag,
-		timeout: cfg.Timeout,
+		timeout: cfg.FluentConfig.Timeout,
 	}
 
 	// Configure structured logging pipeline
 	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
-		TimeKey:        "logging_timestamp",
+		TimeKey:        "timestamp",
+		LevelKey:       "severity",
+		NameKey:        "logger",
+		CallerKey:      "caller",
 		MessageKey:     "message",
-		LevelKey:       "severity", // Standardized field name for GCP/Cloud logging
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
 		EncodeTime:     zapcore.RFC3339NanoTimeEncoder,
-		EncodeLevel:    zapcore.LowercaseLevelEncoder,  // "info" vs "INFO" for parser compatibility
-		EncodeDuration: zapcore.SecondsDurationEncoder, // Decimal seconds for metrics systems
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	})
 
+	lvl := parseLogLevel(cfg.LogLevel)
 	core := zapcore.NewCore(
 		encoder,
 		zapcore.AddSync(fluentLogger),
-		zapcore.InfoLevel,
+		lvl,
 	)
 
-	return &WrappedLogger{
+	return &SugaredLogger{
 		SugaredLogger: zap.New(core).Sugar(),
 		fluent:        fluentLogger,
 	}, nil
@@ -92,10 +101,7 @@ func NewWrappedLogger(cfg FluentConfig) (*WrappedLogger, error) {
 
 // Write implements zapcore.WriteSyncer with proper error handling and JSON parsing
 func (f *FluentLogger) Write(p []byte) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.closed {
+	if f.closed.Load() {
 		return 0, ErrLoggerClosed
 	}
 
@@ -105,9 +111,9 @@ func (f *FluentLogger) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("log decode failed: %w", err)
 	}
 
-	// Fluent-specific routing
+	// Async PostWithTime handles its own synchronization
 	if err := f.logger.PostWithTime(f.tag, time.Now(), entry); err != nil {
-		return 0, fmt.Errorf("failed to send log entry: %w", err)
+		return 0, fmt.Errorf("log delivery failed: %w", err)
 	}
 
 	return len(p), nil
@@ -115,31 +121,54 @@ func (f *FluentLogger) Write(p []byte) (int, error) {
 
 // Sync implements proper resource cleanup with timeout
 func (f *FluentLogger) Sync() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if f.closed {
+	if f.closed.Swap(true) {
 		return nil
 	}
 
-	f.closed = true
-	return f.logger.Close()
+	// Flush remaining logs with timeout
+	done := make(chan struct{})
+	go func() {
+		f.logger.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(f.timeout):
+		return errors.New("fluent log flush timed out")
+	}
 }
 
 // Close implements graceful shutdown of an instance of WrappedLogger with context.
-func (l *WrappedLogger) Close() error {
+func (l *SugaredLogger) Close() error {
 	if l == nil {
 		return nil
 	}
 
-	// Flush buffered logs with timeout
 	var err error
 	l.closeOnce.Do(func() {
 		_, cancel := context.WithTimeout(context.Background(), l.fluent.timeout)
 		defer cancel()
 
-		err = l.Sync()
-		l.fluent.Sync() // Explicit cleanup
+		// Flush Zap first to ensure all logs are sent to Fluent
+		if syncErr := l.SugaredLogger.Sync(); syncErr != nil {
+			err = fmt.Errorf("zap sync failed: %w", syncErr)
+		}
+
+		// Then close Fluent connection
+		if fluentErr := l.fluent.Sync(); fluentErr != nil {
+			err = fmt.Errorf("fluent close failed: %w", fluentErr)
+		}
 	})
 	return err
+}
+
+func parseLogLevel(lvl string) zapcore.Level {
+	level := defaultLogLevel
+	err := level.UnmarshalText([]byte(lvl)) // if something unknown was provided, just stay with debug
+	if err != nil && strings.ToUpper(lvl) == compatibleLevelWarningUpperCase {
+		level = zapcore.WarnLevel
+	}
+	return level
 }
